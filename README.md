@@ -61,8 +61,9 @@ Everything looks too small or too big? Add `?s=0.0012` to the link (metres per m
 ## How it works
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph Mac
+    direction LR
     SCK[ScreenCaptureKit<br>one stream per window] --> qwd[qwd<br>Swift]
     qwd -- JPEG frames + window list --> srv[server.py<br>HTTPS :8443]
     srv -- clicks, drags, scroll --> qwd
