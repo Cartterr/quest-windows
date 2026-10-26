@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mac Windows</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #050506; color: #eee; font: 16px system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; }
+  #st { position: fixed; top: 12px; left: 16px; opacity: .6; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 24px; display: flex; gap: 12px; justify-content: center; }
+  button { font: inherit; font-size: 20px; padding: 14px 28px; border: 0; border-radius: 12px; background: #2b6cf0; color: #fff; }
+  button[hidden] { display: none; }
+</style>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }</script>
+</head>
+<body>
+<div id="st">connecting…</div>
+<div id="ui"><button id="ar" hidden>Enter AR</button><button id="vr" hidden>Enter VR</button></div>
+<script type="module">
+import * as THREE from 'three';
+
+const S = +new URLSearchParams(location.search).get('s') || 0.0009;   // metres per macOS point (?s= resizes everything)
+const R = 1.6;     // how far windows sit from you
+const EYE = 1.4;
+const st = t => document.getElementById('st').textContent = t;
+
+// scene
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setFoveation(0);   // keeps text sharp away from the centre
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(), VOID = new THREE.Color(0x050506);
+scene.background = VOID;
+const grid = new THREE.GridHelper(40, 80, 0x2c2c2e, 0x1c1c1e);
+scene.add(grid);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 100);
+camera.position.set(0, EYE, 0);
+camera.rotation.order = 'YXZ';
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+const head = new THREE.Vector3(), fwd = new THREE.Vector3();
+
+// windows
+const wins = new Map();   // id -> { info, mesh, group, handle, tex, seq, shown }
+const targets = [];       // what pointers can hit: window meshes and grab handles
+const quad = new THREE.PlaneGeometry(1, 1);
+const handleGeo = new THREE.PlaneGeometry(0.16, 0.016);
+const handleMat = new THREE.MeshBasicMaterial({ color: 0xb0b0b4, transparent: true, opacity: 0.75 });
+const dot = new THREE.Mesh(new THREE.CircleGeometry(0.004, 20), new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }));
+dot.renderOrder = 1;
+const drop = (arr, x) => { const i = arr.indexOf(x); if (i >= 0) arr.splice(i, 1); };
+let laidOut = false;
+
+function setTop(w, top) {   // top-level windows get their own group and a grab handle; returns true when one is created
+  if (top === !!w.group) return false;
+  if (top) {
+    w.group = new THREE.Group();
+    w.handle = new THREE.Mesh(handleGeo, handleMat);
+    w.handle.userData.grab = w.group;
+    w.group.add(w.mesh, w.handle);
+    targets.push(w.handle);
+    scene.add(w.group);
+  } else {
+    drop(targets, w.handle);
+    w.group.removeFromParent();
+    w.group = w.handle = null;
+  }
+  return top;
+}
+
+function onList(list) {
+  const ids = new Set(list.map(i => i.id));
+  for (const [id, w] of wins) {
+    if (ids.has(id)) continue;
+    w.group?.removeFromParent();
+    w.mesh.removeFromParent();
+    drop(targets, w.mesh);
+    drop(targets, w.handle);
+    w.tex?.image.close();
+    w.tex?.dispose();
+    w.mesh.material.dispose();
+    wins.delete(id);
+  }
+  for (const info of list) {
+    let w = wins.get(info.id);
+    if (!w) {
+      w = { mesh: new THREE.Mesh(quad, new THREE.MeshBasicMaterial({ color: 0x1c1c1e })), seq: 0, shown: 0 };
+      w.mesh.userData.id = info.id;
+      targets.push(w.mesh);
+      wins.set(info.id, w);
+    }
+    w.info = info;
+    w.mesh.scale.set(info.w * S, info.h * S, 1);
+  }
+  const born = [];
+  for (const info of list) if (!info.layer && setTop(wins.get(info.id), true)) born.push(wins.get(info.id));
+  // menus, popovers and panels ride on their app's window, offset as on the Mac
+  const overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  for (const info of list) {
+    if (!info.layer) continue;
+    const w = wins.get(info.id), mains = list.filter(m => !m.layer && m.pid === info.pid);
+    const p = mains.find(m => overlap(m, info)) || mains[0];
+    if (setTop(w, !p)) born.push(w);
+    if (p) {
+      wins.get(p.id).group.add(w.mesh);
+      w.mesh.position.set((info.x + info.w / 2 - p.x - p.w / 2) * S, -(info.y + info.h / 2 - p.y - p.h / 2) * S, 0.01);
+    }
+  }
+  for (const w of wins.values()) if (w.group) {
+    w.mesh.position.set(0, 0, 0);
+    w.handle.position.y = -w.info.h * S / 2 - 0.03;
+  }
+  if (!laidOut && born.length) { arc(born); laidOut = true; } else born.forEach(inFront);
+  st(wins.size ? '' : 'no windows on the Mac');
+}
+
+function arc(ws) {   // first list: rows of windows on an arc around you
+  const rows = [[]];
+  let span = 0;
+  for (const w of ws) {
+    const a = w.info.w * S / R + 0.05;
+    if (span + a > 3.4 && rows.at(-1).length) { rows.push([]); span = 0; }
+    rows.at(-1).push([w, a]);
+    span += a;
+  }
+  let y = EYE, prev = 0;
+  for (const row of rows) {
+    const h = Math.max(...row.map(([w]) => w.info.h * S));
+    if (prev) y += (prev + h) / 2 + 0.08;
+    prev = h;
+    let t = -row.reduce((s, [, a]) => s + a, 0) / 2;
+    for (const [w, a] of row) {
+      const c = t + a / 2;
+      t += a;
+      w.group.position.set(Math.sin(c) * R, y, -Math.cos(c) * R);
+      w.group.lookAt(0, y, 0);
+    }
+  }
+}
+
+function inFront(w) {   // later windows open where you are looking
+  camera.getWorldPosition(head);
+  camera.getWorldDirection(fwd);
+  fwd.y = 0;
+  fwd.normalize();
+  w.group.position.copy(head).addScaledVector(fwd, R * 0.9);
+  w.group.lookAt(head.x, w.group.position.y, head.z);
+}
+
+async function onFrame(id, bytes) {
+  const w = wins.get(id);
+  if (!w) return;
+  const seq = ++w.seq;
+  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }), { imageOrientation: 'flipY' });
+  if (seq < w.shown || wins.get(id) !== w) return bmp.close();
+  w.shown = seq;
+  if (w.tex && (w.tex.image.width !== bmp.width || w.tex.image.height !== bmp.height)) {
+    w.tex.image.close();
+    w.tex.dispose();
+    w.tex = null;
+  }
+  if (!w.tex) {
+    w.tex = new THREE.Texture(bmp);
+    w.tex.colorSpace = THREE.SRGBColorSpace;
+    w.tex.flipY = false;
+    w.tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    w.mesh.material.map = w.tex;
+    w.mesh.material.color.set(0xffffff);
+    w.mesh.material.needsUpdate = true;
+  } else {
+    w.tex.image.close();
+    w.tex.image = bmp;
+  }
+  w.tex.needsUpdate = true;
+}
+
+function onCursor(m) {   // the Mac's own cursor, so the trackpad works too
+  const w = wins.get(m.id), parent = w?.mesh.parent;
+  if (!parent) return void dot.removeFromParent();
+  parent.add(dot);
+  dot.position.set(w.mesh.position.x + (m.x - 0.5) * w.info.w * S, w.mesh.position.y + (0.5 - m.y) * w.info.h * S, w.mesh.position.z + 0.002);
+}
+
+// stream: [u8 type][u32 id][u32 length][payload]
+const dec = new TextDecoder();
+async function connect() {
+  try {
+    const res = await fetch('stream', { cache: 'no-store' });
+    if (!res.ok) throw new Error(res.status);
+    const reader = res.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const b = new Uint8Array(buf.length + value.length);
+      b.set(buf);
+      b.set(value, buf.length);
+      buf = b;
+      while (buf.length >= 9) {
+        const dv = new DataView(buf.buffer, buf.byteOffset, 9), n = dv.getUint32(5);
+        if (buf.length < 9 + n) break;
+        const type = buf[0], id = dv.getUint32(1), body = buf.subarray(9, 9 + n);
+        buf = buf.subarray(9 + n);
+        if (type === 1) onFrame(id, body);
+        else if (type === 2) onList(JSON.parse(dec.decode(body)));
+        else if (type === 3) onCursor(JSON.parse(dec.decode(body)));
+      }
+    }
+  } catch (e) { console.warn(e); }
+  st('reconnecting…');
+  setTimeout(connect, 2000);
+}
+connect();
+
+// input: one POST at a time keeps events in order; queued moves and scrolls coalesce
+let queue = [], sending = false;
+function send(e) {
+  const last = queue.at(-1);
+  if (e.t === 'move' && last?.t === 'move') queue[queue.length - 1] = e;
+  else if (e.t === 'scroll' && last?.t === 'scroll' && last.id === e.id) { last.dx += e.dx; last.dy += e.dy; }
+  else queue.push(e);
+  if (!sending) flush();
+}
+async function flush() {
+  sending = true;
+  while (queue.length) {
+    const batch = queue;
+    queue = [];
+    try { await fetch('input', { method: 'POST', body: JSON.stringify(batch) }); } catch {}
+  }
+  sending = false;
+}
+
+// pointers: XR controllers and hands, or the mouse outside XR
+const local = new THREE.Ray(), inv = new THREE.Matrix4();
+let active = null;   // the pointer that drives the Mac cursor
+
+function hitOf(p) {
+  const h = p.ray.intersectObjects(targets, false)[0];
+  if (!h) return null;
+  const grab = h.object.userData.grab;
+  return grab ? { grab, point: h.point, distance: h.distance } : { id: h.object.userData.id, x: h.uv.x, y: 1 - h.uv.y, distance: h.distance };
+}
+
+function onPlane(p, id) {   // keeps a drag going past the window's edge
+  const w = wins.get(id);
+  if (!w) return null;
+  local.copy(p.ray.ray).applyMatrix4(inv.copy(w.mesh.matrixWorld).invert());
+  const t = -local.origin.z / local.direction.z;
+  if (!(t > 0)) return null;
+  return { id, x: local.origin.x + local.direction.x * t + 0.5, y: 0.5 - local.origin.y - local.direction.y * t };
+}
+
+function down(p, b) {
+  const h = hitOf(p);
+  if (!h) return false;
+  active = p;
+  if (h.grab) {
+    p.held = { grab: h.grab, dist: h.distance, off: h.grab.position.clone().sub(h.point) };
+  } else {
+    p.held = { id: h.id };
+    p.last = h;
+    send({ t: 'down', id: h.id, x: h.x, y: h.y, b });
+  }
+  return true;
+}
+
+function up(p) {
+  const held = p.held;
+  p.held = null;
+  if (held?.id) {
+    const at = onPlane(p, held.id) || p.last;
+    send({ t: 'up', id: held.id, x: at.x, y: at.y });
+  }
+}
+
+function update(p, stick) {
+  const [sx, sy] = stick || [0, 0];
+  if (p.held?.grab) {   // carrying a window; thumbstick pushes it away or pulls it in
+    const g = p.held.grab;
+    p.held.dist = THREE.MathUtils.clamp(p.held.dist * (1 - sy * 0.02), 0.3, 8);
+    g.position.copy(p.ray.ray.origin).addScaledVector(p.ray.ray.direction, p.held.dist).add(p.held.off);
+    camera.getWorldPosition(head);
+    g.lookAt(head);
+    return;
+  }
+  const h = p.held ? onPlane(p, p.held.id) : hitOf(p);
+  if (p.line) p.line.scale.z = h?.distance || 4;
+  p.hitting = !!h?.id;
+  if (!p.hitting || (active && active !== p && active.hitting && !p.held)) return;
+  active = p;
+  const w = wins.get(h.id), l = p.last;
+  if (!l || l.id !== h.id || Math.abs(l.x - h.x) * w.info.w > 1.5 || Math.abs(l.y - h.y) * w.info.h > 1.5) {
+    p.last = h;
+    send({ t: 'move', id: h.id, x: h.x, y: h.y });
+  }
+  if (!p.held && (Math.abs(sx) > 0.15 || Math.abs(sy) > 0.15)) send({ t: 'scroll', id: h.id, x: h.x, y: h.y, dx: -sx * 20, dy: -sy * 20 });
+}
+
+const xrPointers = [0, 1].map(i => {
+  const c = renderer.xr.getController(i);
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 }));
+  c.add(line);
+  scene.add(c);
+  const p = { c, line, ray: new THREE.Raycaster(), held: null, src: null };
+  c.addEventListener('connected', e => p.src = e.data);
+  c.addEventListener('disconnected', () => { up(p); p.src = null; });
+  c.addEventListener('selectstart', () => down(p, 0));   // trigger or pinch: left click
+  c.addEventListener('selectend', () => up(p));
+  c.addEventListener('squeezestart', () => down(p, 1));  // grip: right click
+  c.addEventListener('squeezeend', () => up(p));
+  return p;
+});
+
+const mouse = { ray: new THREE.Raycaster(), held: null, ndc: new THREE.Vector2(), look: false };
+const canvas = renderer.domElement;
+const toNdc = e => mouse.ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+canvas.addEventListener('pointermove', e => {
+  toNdc(e);
+  if (!mouse.look) return;   // dragging empty space looks around
+  camera.rotation.y += e.movementX * 0.004;
+  camera.rotation.x = THREE.MathUtils.clamp(camera.rotation.x + e.movementY * 0.004, -1.4, 1.4);
+});
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  toNdc(e);
+  mouse.ray.setFromCamera(mouse.ndc, camera);
+  mouse.look = !down(mouse, e.button === 2 ? 1 : 0);
+});
+canvas.addEventListener('pointerup', () => { mouse.look = false; up(mouse); });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const h = hitOf(mouse);
+  if (h?.id) send({ t: 'scroll', id: h.id, x: h.x, y: h.y, dx: -e.deltaX, dy: -e.deltaY });
+}, { passive: false });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+renderer.setAnimationLoop(() => {
+  if (renderer.xr.isPresenting) {
+    for (const p of xrPointers) {
+      if (!p.src) continue;
+      p.c.updateMatrixWorld();
+      p.ray.ray.origin.setFromMatrixPosition(p.c.matrixWorld);
+      p.ray.ray.direction.set(0, 0, -1).transformDirection(p.c.matrixWorld);
+      const a = p.src.gamepad?.axes;
+      update(p, a?.length >= 4 ? [a[2], a[3]] : null);
+    }
+  } else {
+    mouse.ray.setFromCamera(mouse.ndc, camera);
+    update(mouse, null);
+  }
+  renderer.render(scene, camera);
+});
+
+for (const [id, mode] of [['ar', 'immersive-ar'], ['vr', 'immersive-vr']]) {
+  const btn = document.getElementById(id);
+  navigator.xr?.isSessionSupported(mode).then(ok => btn.hidden = !ok);
+  btn.onclick = async () => {
+    const s = await navigator.xr.requestSession(mode, { optionalFeatures: ['local-floor', 'hand-tracking'] });
+    const ar = mode === 'immersive-ar';   // AR: windows float in your room over passthrough
+    scene.background = ar ? null : VOID;
+    grid.visible = !ar;
+    s.addEventListener('end', () => { scene.background = VOID; grid.visible = true; });
+    renderer.xr.setSession(s);
+  };
+}
+</script>
+</body>
+</html>
